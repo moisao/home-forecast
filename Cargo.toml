@@ -1,0 +1,24 @@
+[package]
+name = "home-forecast"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "24-hour hourly point forecasts from NOAA RRFS/HRRR as JSON, for Home Assistant"
+license = "MIT"
+repository = "https://github.com/moisao/home-forecast"
+
+[dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+chrono-tz = "0.10.4"
+env_logger = "0.11.11"
+grib = { version = "0.20.3", default-features = false }
+log = "0.4.35"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tiny_http = "0.12.0"
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

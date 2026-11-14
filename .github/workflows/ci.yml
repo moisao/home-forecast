@@ -1,0 +1,74 @@
+name: ci
+
+# Every push and PR: fmt, clippy, tests. On main and on v* tags, also
+# publishes ghcr.io/<owner>/home-forecast for linux/amd64 and linux/arm64:
+#   main      -> :main, :sha-<commit>
+#   v1.2.3    -> :1.2.3, :1.2, :latest
+# Weekly rebuilds of main pick up base-image security fixes.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  schedule:
+    - cron: "41 9 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container: rust:1.99-slim-trixie
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup component add clippy rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  image:
+    needs: test
+    # Publishes only from this repository's main and version tags: never
+    # from pull requests or forks.
+    if: >-
+      github.event_name != 'pull_request'
+      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/home-forecast
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          pull: true
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
