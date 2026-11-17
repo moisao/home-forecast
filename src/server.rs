@@ -178,9 +178,13 @@ impl Forecaster {
                 }
                 state.plan = Some(plan.clone());
                 info!(
-                    "Updated {} location(s): {}, runs {}, {:.0} MB downloaded, in {:.1}s",
+                    "Updated {} location(s): {}{}, runs {}, {:.0} MB downloaded, in {:.1}s",
                     todo.len(),
                     plan.model.label(),
+                    plan.blend
+                        .as_ref()
+                        .map(|b| format!(" + {} clouds and rain", b.model.label()))
+                        .unwrap_or_default(),
                     runs.join(", "),
                     downloaded as f64 / 1e6,
                     started.elapsed().as_secs_f64()

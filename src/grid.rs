@@ -111,17 +111,100 @@ fn cone_constant(latin1: f64, latin2: f64) -> f64 {
 /// points (the whole-grid unpack is the work; picking values out of it is
 /// nothing). None for a point off the grid; NaN where the bitmap masks it.
 pub fn values_at(message: Vec<u8>, points: &[(f64, f64)]) -> Result<Vec<Option<(f64, GridPoint)>>> {
+    Ok(sample(message, points, 0.)?
+        .into_iter()
+        .map(|s| s.map(|(values, point)| (values[0], point)))
+        .collect())
+}
+
+/// What a field does in the area around a point rather than at it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Area {
+    /// Over the grid points within the radius.
+    pub mean: f64,
+    /// The share of them at or above the threshold, 0 to 1.
+    pub share: f64,
+}
+
+/// Like values_at, over every grid point within `radius_m` of each point:
+/// a 3 km model puts a shower in the right place far less often than it
+/// gets it within a few kilometres. Masked values are left out.
+pub fn areas_at(
+    message: Vec<u8>,
+    points: &[(f64, f64)],
+    radius_m: f64,
+    threshold: f64,
+) -> Result<Vec<Option<(Area, GridPoint)>>> {
+    Ok(sample(message, points, radius_m)?
+        .into_iter()
+        .map(|s| {
+            s.and_then(|(values, point)| {
+                let finite: Vec<f64> = values.into_iter().filter(|v| v.is_finite()).collect();
+                if finite.is_empty() {
+                    return None;
+                }
+                let n = finite.len() as f64;
+                Some((
+                    Area {
+                        mean: finite.iter().sum::<f64>() / n,
+                        share: finite.iter().filter(|&&v| v >= threshold).count() as f64 / n,
+                    },
+                    point,
+                ))
+            })
+        })
+        .collect())
+}
+
+/// Grid indexes within `radius_m` of a grid point, the point itself first.
+fn around(t: &Template3_30, point: &GridPoint, radius_m: f64) -> Vec<usize> {
+    let (ni, nj) = (t.ni as i64, t.nj as i64);
+    let (dx, dy) = (t.dx as f64 * 1e-3, t.dy as f64 * 1e-3);
+    let (i0, j0) = ((point.index as i64) % ni, (point.index as i64) / ni);
+    let mut out = vec![point.index];
+    let (ri, rj) = ((radius_m / dx) as i64, (radius_m / dy) as i64);
+    for dj in -rj..=rj {
+        for di in -ri..=ri {
+            let (i, j) = (i0 + di, j0 + dj);
+            if (di, dj) == (0, 0)
+                || i < 0
+                || j < 0
+                || i >= ni
+                || j >= nj
+                || (di as f64 * dx).hypot(dj as f64 * dy) > radius_m
+            {
+                continue;
+            }
+            out.push((j * ni + i) as usize);
+        }
+    }
+    out
+}
+
+/// Values around a point (see `around`) and the grid point itself.
+type Sample = (Vec<f64>, GridPoint);
+
+/// Each point's grid point and the values around it.
+fn sample(message: Vec<u8>, points: &[(f64, f64)], radius_m: f64) -> Result<Vec<Option<Sample>>> {
     let grib2 = grib::from_bytes(message)?;
     let (_, submessage) = grib2.iter().next().ok_or("empty GRIB2 message")?;
-    let located: Vec<Option<GridPoint>> =
+    let located: Vec<Option<(GridPoint, Vec<usize>)>> =
         match GridDefinitionTemplateValues::try_from(submessage.grid_def())? {
             GridDefinitionTemplateValues::Template30(t) => points
                 .iter()
-                .map(|&(lat, lon)| locate(&t, lat, lon).ok())
+                .map(|&(lat, lon)| {
+                    locate(&t, lat, lon)
+                        .ok()
+                        .map(|p| (p, around(&t, &p, radius_m)))
+                })
                 .collect(),
             _ => return Err("not a Lambert conformal grid".into()),
         };
-    let mut wanted: Vec<usize> = located.iter().flatten().map(|p| p.index).collect();
+    let mut wanted: Vec<usize> = located
+        .iter()
+        .flatten()
+        .flat_map(|(_, near)| near.iter().copied())
+        .collect();
     wanted.sort_unstable();
     wanted.dedup();
     let mut found = std::collections::HashMap::with_capacity(wanted.len());
@@ -140,7 +223,7 @@ pub fn values_at(message: Vec<u8>, points: &[(f64, f64)]) -> Result<Vec<Option<(
     }
     Ok(located
         .into_iter()
-        .map(|p| p.map(|p| (found[&p.index], p)))
+        .map(|p| p.map(|(p, near)| (near.iter().map(|i| found[i]).collect(), p)))
         .collect())
 }
 
@@ -232,6 +315,19 @@ mod tests {
         assert!((value - 290.89).abs() < 0.01, "{value}");
         assert_eq!(values[1], values[0]);
         assert!(values[2].is_none());
+    }
+
+    #[test]
+    fn area_around_a_point() {
+        let grid = rrfs_grid();
+        let point = locate(&grid, 32.988, -117.122).unwrap();
+        let near = around(&grid, &point, 10_000.);
+        assert_eq!(near[0], point.index);
+        // Within 10 km on a 3 km grid: di^2 + dj^2 <= 11, 37 points.
+        assert_eq!(near.len(), 37);
+        assert!(near.contains(&(point.index + 3)) && near.contains(&(point.index - 1799 * 3)));
+        assert!(!near.contains(&(point.index + 1799 * 3 + 3)));
+        assert_eq!(around(&grid, &point, 0.), vec![point.index]);
     }
 
     #[test]
