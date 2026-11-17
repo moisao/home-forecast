@@ -1,8 +1,9 @@
 # home-forecast
 
 The next 24 hours, hour by hour, at the places you name, from NOAA's
-[RRFS](https://registry.opendata.aws/noaa-rrfs/) 3 km model (falling back to
-[HRRR](https://registry.opendata.aws/noaa-hrrr-pds/)), served as JSON. It's
+[RRFS](https://registry.opendata.aws/noaa-rrfs/) 3 km model, with clouds and
+rain blended with [HRRR](https://registry.opendata.aws/noaa-hrrr-pds/)'s (and
+HRRR as a fallback), served as JSON. It's
 made to feed a [Home Assistant](https://www.home-assistant.io/) weather entity.
 
 For each hour:
@@ -12,8 +13,9 @@ For each hour:
 | `temperature_c`, `dew_point_c` | 2 m temperature and dewpoint |
 | `humidity` | from those two (Magnus) |
 | `wind_speed_ms`, `wind_bearing`, `wind_gust_ms` | 10 m wind, surface gust |
-| `precipitation_mm` | the hour's total |
-| `cloud_coverage` | total cloud, % |
+| `precipitation_mm` | the total for the hour starting at `time`, averaged over 10 km and both models |
+| `precipitation_probability` | the share of that area, in both models, getting at least 0.01 in (0.25 mm) that hour, % |
+| `cloud_coverage` | total cloud, %, averaged over 10 km and both models |
 | `uv_index` | **estimated**: the models publish none (see below) |
 | `condition` | a Home Assistant condition (`sunny`, `partlycloudy`, `rainy`, ...) |
 | `daylight` | whether the sun is up |
@@ -32,9 +34,28 @@ A new model run (RRFS posts every 3 hours) costs about 250 MB however many
 locations there are. No API keys and no third-party weather service are
 involved.
 
-Each hour comes from the freshest run that reaches it. The whole 24 hours
-come from one model, since a switch of model partway through would read as
-a change in the weather.
+Each hour comes from the freshest run that reaches it. Temperature,
+humidity and wind for all 24 hours come from one model, since a switch of
+model partway through would read as a change in the weather.
+
+Clouds and rain are where a 3 km model is least reliable at a single grid
+point: it often gets a shower right within a few kilometres and an hour
+but not at the point itself, and one model often keeps a shower that the
+other drops between runs. So they are read differently:
+
+- **Over an area**: the mean over every grid point within 10 km (37
+  points), not the one nearest.
+- **From both models**: the other model's clouds and rain (HRRR's, with
+  RRFS as the main model) are averaged in where it has the hour. HRRR runs
+  hourly, so this also picks up newer data between RRFS runs. A new HRRR
+  run costs about 30 MB: two fields for 25 hours.
+- **Chance of rain**: the share of those grid points, across both models,
+  that get measurable rain in the hour.
+
+Set `MODEL` to use one model alone, without the blend.
+
+Each hour's rain is the hour *starting* at its time, as Home Assistant
+reads a forecast hour: the 6 pm entry is the rain from 6 to 7 pm.
 
 ## Running it
 
@@ -57,7 +78,7 @@ curl -s localhost:8080/forecast/little-black
 | `PORT` | default `8080` |
 | `TZ` | the zone times are given in, default `America/Los_Angeles` |
 | `CACHE_DIR` | keep decoded values here, so a restart doesn't download again |
-| `MODEL` | `rrfs` or `hrrr` only, instead of RRFS then HRRR |
+| `MODEL` | `rrfs` or `hrrr` alone, instead of RRFS then HRRR with the other's clouds and rain blended in |
 | `RUST_LOG` | default `info` |
 
 Your locations are probably where you live. Keep them in a secret store
@@ -91,6 +112,8 @@ every request.
   "model": "RRFS 3 km",
   "generated": "2026-11-14T14:23:46-08:00",
   "runs": ["2026-11-14T18:00:00+00:00", "2026-11-14T21:00:00+00:00"],
+  "blend_model": "HRRR 3 km",
+  "blend_runs": ["2026-11-14T21:00:00+00:00", "2026-11-14T22:00:00+00:00"],
   "downloaded_mb": 0.0,
   "sunrise": "2026-11-14T06:18:01-08:00",
   "sunset": "2026-11-14T16:48:25-08:00",
@@ -109,6 +132,7 @@ every request.
       "wind_gust_ms": 4.0,
       "wind_bearing": 245.0,
       "precipitation_mm": 0.31,
+      "precipitation_probability": 40.0,
       "cloud_coverage": 99.0,
       "uv_index": 0.9,
       "daylight": true,
@@ -136,7 +160,7 @@ rest:
         unique_id: home_forecast_updated
         device_class: timestamp
         value_template: "{{ value_json.generated }}"
-        json_attributes: [model, runs, sunrise, sunset, next_sunrise, next_sunset, hours]
+        json_attributes: [model, runs, blend_model, blend_runs, sunrise, sunset, next_sunrise, next_sunset, hours]
 
 template:
   - weather:
@@ -161,6 +185,7 @@ template:
               'is_daytime': h.daylight, 'temperature': h.temperature_c, 'dew_point': h.dew_point_c,
               'humidity': h.humidity, 'wind_speed': h.wind_speed_ms, 'wind_gust_speed': h.wind_gust_ms,
               'wind_bearing': h.wind_bearing, 'precipitation': h.precipitation_mm,
+              'precipitation_probability': h.precipitation_probability,
               'cloud_coverage': h.cloud_coverage, 'uv_index': h.uv_index}] %}
           {% endfor %}
           {{ ns.out }}

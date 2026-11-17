@@ -13,7 +13,8 @@
 //!   PORT          default 8080
 //!   TZ            the zone times are given in (default America/Los_Angeles)
 //!   CACHE_DIR     keep decoded point values here across restarts
-//!   MODEL         rrfs or hrrr only, instead of RRFS then HRRR
+//!   MODEL         rrfs or hrrr only, instead of RRFS then HRRR, with the
+//!                 other's clouds and rain blended in
 //!   RUST_LOG      default info
 
 mod forecast;
