@@ -1,4 +1,4 @@
-//! home-forecast: the next 24 hours at named locations from NOAA's RRFS
+//! home-forecast: the next three days at named locations from NOAA's RRFS
 //! (HRRR as a fallback), as JSON -- made for a Home Assistant weather
 //! entity.
 //!
@@ -13,6 +13,7 @@
 //!   PORT          default 8080
 //!   TZ            the zone times are given in (default America/Los_Angeles)
 //!   CACHE_DIR     keep decoded point values here across restarts
+//!   FORECAST_HOURS  how far ahead, 1 to 84 (default 72)
 //!   MODEL         rrfs or hrrr only, instead of RRFS then HRRR, with the
 //!                 other's clouds and rain blended in
 //!   RUST_LOG      default info
@@ -54,6 +55,20 @@ fn run() -> Result<()> {
         ],
         None => vec![],
     };
+    let hours = match env("FORECAST_HOURS") {
+        Some(v) => v
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|h| (1..=forecast::MAX_HOURS).contains(h))
+            .ok_or_else(|| {
+                format!(
+                    "FORECAST_HOURS: a number of hours from 1 to {}",
+                    forecast::MAX_HOURS
+                )
+            })?,
+        None => forecast::DEFAULT_HOURS,
+    };
     let locations = locations::parse(&env("LOCATIONS").unwrap_or_default())?;
     let allow_adhoc = env("ALLOW_ADHOC")
         .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
@@ -71,6 +86,7 @@ fn run() -> Result<()> {
             let port = env("PORT").as_deref().unwrap_or("8080").parse()?;
             let config = server::Config {
                 tz,
+                hours,
                 models,
                 locations,
                 allow_adhoc,
@@ -97,7 +113,7 @@ fn run() -> Result<()> {
             };
             let fetcher = models::Fetcher::new();
             let now = Utc::now();
-            let plan = forecast::plan(&fetcher, &models, now)?;
+            let plan = forecast::plan(&fetcher, &models, hours, now)?;
             let (mut forecasts, _) =
                 forecast::forecast_all(&fetcher, &cache, &[target], tz, &plan, now)?;
             println!("{}", serde_json::to_string_pretty(&forecasts.remove(0)?)?);

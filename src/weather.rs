@@ -71,6 +71,38 @@ pub fn condition(
     }
 }
 
+/// A day's condition from its hours: rain first (pouring if any hour
+/// pours, rainy at 1 mm or more over the day), then a strong breeze at any
+/// hour, then the mean cloud while the sun is up.
+pub fn daily_condition(
+    rain_mm: Option<f64>,
+    any_pouring: bool,
+    daytime_cloud_pct: Option<f64>,
+    max_wind_ms: f64,
+) -> &'static str {
+    if any_pouring {
+        return "pouring";
+    }
+    if rain_mm.unwrap_or(0.) >= 1. {
+        return "rainy";
+    }
+    let cloud = daytime_cloud_pct.unwrap_or(0.);
+    if max_wind_ms >= 10.8 {
+        return if cloud > 75. {
+            "windy-variant"
+        } else {
+            "windy"
+        };
+    }
+    if cloud > 75. {
+        "cloudy"
+    } else if cloud > 25. {
+        "partlycloudy"
+    } else {
+        "sunny"
+    }
+}
+
 pub fn round(value: f64, digits: i32) -> f64 {
     let scale = 10f64.powi(digits);
     (value * scale).round() / scale
@@ -79,6 +111,15 @@ pub fn round(value: f64, digits: i32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daily_conditions() {
+        assert_eq!(daily_condition(Some(0.4), false, Some(90.), 3.), "cloudy");
+        assert_eq!(daily_condition(Some(2.), false, Some(10.), 3.), "rainy");
+        assert_eq!(daily_condition(Some(2.), true, Some(10.), 3.), "pouring");
+        assert_eq!(daily_condition(None, false, Some(40.), 12.), "windy");
+        assert_eq!(daily_condition(None, false, None, 3.), "sunny");
+    }
 
     #[test]
     fn humidity() {

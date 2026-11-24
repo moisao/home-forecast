@@ -21,7 +21,7 @@ pub enum Model {
     Hrrr,
 }
 
-/// Tried in this order: one model for all 24 hours, the first that has
+/// Tried in this order: one model for every hour, the first that has
 /// every hour, else whichever has the most. GFS is left out on purpose:
 /// at 0.25 degrees it is too coarse for one house.
 pub const DEFAULT_MODELS: [Model; 2] = [Model::Rrfs, Model::Hrrr];
