@@ -39,6 +39,8 @@ const FORGET_AFTER_DAYS: i64 = 7;
 
 pub struct Config {
     pub tz: Tz,
+    /// How many hours each forecast covers.
+    pub hours: i64,
     pub models: Vec<Model>,
     pub locations: Vec<Target>,
     pub allow_adhoc: bool,
@@ -104,7 +106,8 @@ impl Forecaster {
     fn update(&self) {
         let _one_at_a_time = self.updating.lock().unwrap();
         let now = Utc::now();
-        let plan = match forecast::plan(&self.fetcher, &self.config.models, now) {
+        let plan = match forecast::plan(&self.fetcher, &self.config.models, self.config.hours, now)
+        {
             Ok(plan) => plan,
             Err(e) => {
                 error!("Planning failed: {e}");

@@ -1,6 +1,6 @@
 # home-forecast
 
-The next 24 hours, hour by hour, at the places you name, from NOAA's
+The next three days, hour by hour and by day, at the places you name, from NOAA's
 [RRFS](https://registry.opendata.aws/noaa-rrfs/) 3 km model, with clouds and
 rain blended with [HRRR](https://registry.opendata.aws/noaa-hrrr-pds/)'s (and
 HRRR as a fallback), served as JSON. It's
@@ -20,7 +20,13 @@ For each hour:
 | `condition` | a Home Assistant condition (`sunny`, `partlycloudy`, `rainy`, ...) |
 | `daylight` | whether the sun is up |
 
-plus today's and tomorrow's sunrise and sunset. Coverage is the contiguous
+For each local day (today's from the hours left in it, later days only
+when the forecast covers all 24 of their hours), under `days`: the high
+and low, the day's rain total and its highest hourly chance, the
+strongest hour's wind and its direction, the strongest gust, mean
+humidity, mean cloud while the sun is up, the highest UV, and a condition.
+
+Plus today's and tomorrow's sunrise and sunset. Coverage is the contiguous
 US (CONUS), where RRFS and HRRR run.
 
 ## How it works
@@ -30,12 +36,14 @@ CONUS grid (~350 MB), with an index of where each field sits in it. For each
 hour the service fetches just the fields it needs by HTTP range request,
 about 10 MB, from NOAA's public S3 buckets. It decodes each field once,
 picks out every configured location's value, and keeps only those numbers.
-A new model run (RRFS posts every 3 hours) costs about 250 MB however many
-locations there are. No API keys and no third-party weather service are
-involved.
+The cost depends on how far ahead you ask (`FORECAST_HOURS`) and not on
+how many locations there are: about 11 MB per hour of forecast. RRFS's
+00/06/12/18Z runs reach 84 hours, so each one refetches the whole forecast
+(about 800 MB for 72 hours). The runs between them reach 18 hours. No API
+keys and no third-party weather service are involved.
 
 Each hour comes from the freshest run that reaches it. Temperature,
-humidity and wind for all 24 hours come from one model, since a switch of
+humidity and wind for every hour come from one model, since a switch of
 model partway through would read as a change in the weather.
 
 Clouds and rain are where a 3 km model is least reliable at a single grid
@@ -47,8 +55,9 @@ other drops between runs. So they are read differently:
   points), not the one nearest.
 - **From both models**: the other model's clouds and rain (HRRR's, with
   RRFS as the main model) are averaged in where it has the hour. HRRR runs
-  hourly, so this also picks up newer data between RRFS runs. A new HRRR
-  run costs about 30 MB: two fields for 25 hours.
+  hourly, so this also picks up newer data between RRFS runs. HRRR reaches
+  48 hours, so hours after that are RRFS's alone. A new HRRR run costs about
+  1 MB per hour it covers.
 - **Chance of rain**: the share of those grid points, across both models,
   that get measurable rain in the hour.
 
@@ -75,6 +84,7 @@ curl -s localhost:8080/forecast/little-black
 |---|---|
 | `LOCATIONS` | `name=lat,lon` entries separated by `;` or newlines. Names are `a-z`, `0-9`, `-`, `_`. |
 | `ALLOW_ADHOC` | `true` to also answer `/forecast?lat=..&lon=..` for any point. Off by default: on a shared instance, anyone could make it download and decode new points. |
+| `FORECAST_HOURS` | how far ahead, `1` to `84`, default `72` |
 | `PORT` | default `8080` |
 | `TZ` | the zone times are given in, default `America/Los_Angeles` |
 | `CACHE_DIR` | keep decoded values here, so a restart doesn't download again |
@@ -138,6 +148,22 @@ every request.
       "daylight": true,
       "condition": "rainy"
     }
+  ],
+  "days": [
+    {
+      "date": "2026-11-14T00:00:00-08:00",
+      "temperature_high_c": 18.1,
+      "temperature_low_c": 13.9,
+      "precipitation_mm": 2.4,
+      "precipitation_probability": 70.0,
+      "wind_speed_ms": 4.6,
+      "wind_bearing": 250.0,
+      "wind_gust_ms": 8.2,
+      "humidity": 86.0,
+      "cloud_coverage": 97.0,
+      "uv_index": 1.2,
+      "condition": "rainy"
+    }
   ]
 }
 ```
@@ -147,10 +173,16 @@ produced this response fetched, shared by every location in it.
 
 ## Home Assistant
 
-A REST sensor holding the hours, and a template weather entity built from it.
-Home Assistant converts the units for display.
+A REST sensor holding the hours and days, and a template weather entity
+built from it. Home Assistant converts the units for display. Three days of
+hours is ~25 KB, past the recorder's 16 KB limit for attributes, so the
+sensor is left out of the recorder.
 
 ```yaml
+recorder:
+  exclude:
+    entities: [sensor.home_forecast_updated]
+
 rest:
   - resource: http://home-forecast:8080/forecast/home
     scan_interval: 300
@@ -160,7 +192,7 @@ rest:
         unique_id: home_forecast_updated
         device_class: timestamp
         value_template: "{{ value_json.generated }}"
-        json_attributes: [model, runs, blend_model, blend_runs, sunrise, sunset, next_sunrise, next_sunset, hours]
+        json_attributes: [model, runs, blend_model, blend_runs, sunrise, sunset, next_sunrise, next_sunset, hours, days]
 
 template:
   - weather:
@@ -187,6 +219,17 @@ template:
               'wind_bearing': h.wind_bearing, 'precipitation': h.precipitation_mm,
               'precipitation_probability': h.precipitation_probability,
               'cloud_coverage': h.cloud_coverage, 'uv_index': h.uv_index}] %}
+          {% endfor %}
+          {{ ns.out }}
+        forecast_daily: >-
+          {% set ns = namespace(out=[]) %}
+          {% for d in state_attr('sensor.home_forecast_updated', 'days') or [] %}
+            {% set ns.out = ns.out + [{'datetime': d.date, 'condition': d.condition,
+              'temperature': d.temperature_high_c, 'templow': d.temperature_low_c,
+              'humidity': d.humidity, 'wind_speed': d.wind_speed_ms, 'wind_gust_speed': d.wind_gust_ms,
+              'wind_bearing': d.wind_bearing, 'precipitation': d.precipitation_mm,
+              'precipitation_probability': d.precipitation_probability,
+              'cloud_coverage': d.cloud_coverage, 'uv_index': d.uv_index}] %}
           {% endfor %}
           {{ ns.out }}
 ```

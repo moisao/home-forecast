@@ -1,4 +1,4 @@
-//! The next 24 hours at a point.
+//! The next hours (FORECAST_HOURS, 72 by default) at a point, and each day.
 //!
 //! Each hour comes from the freshest run that reaches it (models.rs), and
 //! each field is one byte-range request for a whole-grid message, decoded
@@ -27,9 +27,13 @@ use crate::Result;
 use crate::grid::{Area, areas_at, earth_wind, values_at};
 use crate::models::{DEFAULT_MODELS, Fetcher, Field, Model, Timing};
 use crate::sun::{cos_zenith, sun_times};
-use crate::weather::{condition, relative_humidity, round, uv_index};
+use crate::weather::{condition, daily_condition, relative_humidity, round, uv_index};
 
-pub const HOURS: i64 = 24;
+/// How many hours a forecast covers unless FORECAST_HOURS says otherwise:
+/// three days, which RRFS's long runs (to f84, four a day) always reach.
+pub const DEFAULT_HOURS: i64 = 72;
+/// RRFS's longest lead.
+pub const MAX_HOURS: i64 = 84;
 
 const TEMPERATURE: Field = Field::new("TMP", "2 m above ground", Timing::Instant);
 const DEWPOINT: Field = Field::new("DPT", "2 m above ground", Timing::Instant);
@@ -81,12 +85,13 @@ fn held_key(field: &Field) -> String {
 /// decoded at once.
 const WORKERS: usize = 8;
 
-/// Which model answers the next 24 hours, and the run and lead of each,
+/// Which model answers the next `span` hours, and the run and lead of each,
 /// plus the other model's for clouds and rain where it has them. Each
 /// covers one more hour than it shows: an hour's rain is the hour after
 /// its time, which the next valid time's file holds.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
+    pub span: i64,
     pub model: Model,
     pub hours: crate::models::Resolved,
     pub blend: Option<Blend>,
@@ -98,21 +103,25 @@ pub struct Blend {
     pub hours: crate::models::Resolved,
 }
 
-/// The current whole hour and the 23 after it.
-pub fn valid_times(now: DateTime<Utc>) -> Vec<DateTime<Utc>> {
-    let start = now
-        .duration_trunc(Duration::hours(1))
-        .expect("hour truncation");
-    (0..HOURS).map(|h| start + Duration::hours(h)).collect()
+/// The current whole hour.
+fn this_hour(now: DateTime<Utc>) -> DateTime<Utc> {
+    now.duration_trunc(Duration::hours(1))
+        .expect("hour truncation")
+}
+
+/// The current whole hour and the `span - 1` after it.
+pub fn valid_times(now: DateTime<Utc>, span: i64) -> Vec<DateTime<Utc>> {
+    let start = this_hour(now);
+    (0..span).map(|h| start + Duration::hours(h)).collect()
 }
 
 /// The first model with every hour, else whichever has the most -- one
 /// model throughout, since a change of model mid-forecast reads as weather
 /// -- and the other model to blend clouds and rain with. Given `models`
 /// (MODEL), only those, with no blend.
-pub fn plan(fetcher: &Fetcher, models: &[Model], now: DateTime<Utc>) -> Result<Plan> {
-    let mut times = valid_times(now);
-    times.push(times[times.len() - 1] + Duration::hours(1));
+pub fn plan(fetcher: &Fetcher, models: &[Model], span: i64, now: DateTime<Utc>) -> Result<Plan> {
+    // One more than shown: the last hour's rain is in the next file.
+    let times = valid_times(now, span + 1);
     let mut best: Option<Plan> = None;
     let mut errors = Vec::new();
     for &model in if models.is_empty() {
@@ -125,6 +134,7 @@ pub fn plan(fetcher: &Fetcher, models: &[Model], now: DateTime<Utc>) -> Result<P
                 let complete = hours.len() == times.len();
                 if best.as_ref().is_none_or(|b| hours.len() > b.hours.len()) {
                     best = Some(Plan {
+                        span,
                         model,
                         hours,
                         blend: None,
@@ -159,7 +169,7 @@ pub fn plan(fetcher: &Fetcher, models: &[Model], now: DateTime<Utc>) -> Result<P
             Ok(plan)
         }
         _ => Err(format!(
-            "No model has the next 24 hours{}",
+            "No model has any of the next {span} hours{}",
             if errors.is_empty() {
                 String::new()
             } else {
@@ -267,6 +277,29 @@ pub struct Hour {
     pub condition: &'static str,
 }
 
+/// A local calendar day, summarised from its hours: today's from the hours
+/// left in it, later days only when the forecast covers all of them.
+#[derive(Clone, Debug, Serialize)]
+pub struct Day {
+    /// Local midnight.
+    pub date: String,
+    pub temperature_high_c: f64,
+    pub temperature_low_c: f64,
+    /// The day's total.
+    pub precipitation_mm: Option<f64>,
+    /// The highest hourly chance, %.
+    pub precipitation_probability: Option<f64>,
+    /// The strongest hour's wind, and its direction.
+    pub wind_speed_ms: f64,
+    pub wind_bearing: f64,
+    pub wind_gust_ms: Option<f64>,
+    /// Means; cloud over the hours the sun is up, if any.
+    pub humidity: f64,
+    pub cloud_coverage: Option<f64>,
+    pub uv_index: f64,
+    pub condition: &'static str,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Forecast {
     /// The configured location's name; None for an ad-hoc point.
@@ -300,6 +333,7 @@ pub struct Forecast {
     pub next_sunrise: Option<String>,
     pub next_sunset: Option<String>,
     pub hours: Vec<Hour>,
+    pub days: Vec<Day>,
 }
 
 fn iso<T: TimeZone>(t: DateTime<T>) -> String
@@ -515,7 +549,7 @@ fn build(
     downloaded: u64,
 ) -> Result<Forecast> {
     let (lat, lon) = (target.lat, target.lon);
-    let end = valid_times(now)[0] + Duration::hours(HOURS);
+    let end = this_hour(now) + Duration::hours(plan.span);
     // valid time -> cache key, for each model.
     let keys = |model: Model, hours: &crate::models::Resolved| -> HashMap<DateTime<Utc>, String> {
         hours
@@ -538,6 +572,7 @@ fn build(
         )
     };
     let mut hours = Vec::new();
+    let mut local_times = Vec::new();
     let mut grid = None;
     let mut skipped = 0;
     for &(valid, run, lead) in plan.hours.iter().filter(|h| h.0 < end) {
@@ -562,6 +597,7 @@ fn build(
         let rain = blended(next, &area_key(&RAIN));
         let rain_chance = blended(next, &wet_key(&RAIN));
         let mu = cos_zenith(lat, lon, valid);
+        local_times.push(valid.with_timezone(&tz));
         hours.push(Hour {
             time: iso(valid.with_timezone(&tz)),
             run: iso(run),
@@ -623,8 +659,76 @@ fn build(
         sunset_tomorrow: sun.tomorrow.map(|s| iso(s.1)),
         next_sunrise: sun.next(now, |s| s.0),
         next_sunset: sun.next(now, |s| s.1),
+        days: days(&local_times, &hours, now.with_timezone(&tz).date_naive()),
         hours,
     })
+}
+
+/// Each local day's summary (see Day). `times` are the hours' local times.
+fn days(times: &[DateTime<Tz>], hours: &[Hour], today: chrono::NaiveDate) -> Vec<Day> {
+    use chrono::Timelike;
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < hours.len() {
+        let date = times[i].date_naive();
+        let n = times[i..]
+            .iter()
+            .take_while(|t| t.date_naive() == date)
+            .count();
+        let (day_times, day) = (&times[i..i + n], &hours[i..i + n]);
+        i += n;
+        let whole = day_times[0].hour() == 0 && day_times[n - 1].hour() == 23;
+        if date != today && !whole {
+            continue;
+        }
+        let temps = || day.iter().map(|h| h.temperature_c);
+        let windiest = day
+            .iter()
+            .max_by(|a, b| a.wind_speed_ms.total_cmp(&b.wind_speed_ms))
+            .unwrap();
+        let some = |values: Vec<f64>| (!values.is_empty()).then_some(values);
+        let rain = some(day.iter().filter_map(|h| h.precipitation_mm).collect())
+            .map(|r| r.iter().sum::<f64>());
+        let chance = day
+            .iter()
+            .filter_map(|h| h.precipitation_probability)
+            .reduce(f64::max);
+        let daytime: Vec<&Hour> = day.iter().filter(|h| h.daylight).collect();
+        let cloud = mean(
+            (if daytime.is_empty() {
+                day.iter().collect()
+            } else {
+                daytime
+            })
+            .iter()
+            .filter_map(|h| h.cloud_coverage),
+        );
+        let midnight = day_times[0]
+            .timezone()
+            .from_local_datetime(&date.and_hms_opt(0, 0, 0).unwrap())
+            .earliest()
+            .unwrap_or(day_times[0]);
+        out.push(Day {
+            date: iso(midnight),
+            temperature_high_c: round(temps().fold(f64::MIN, f64::max), 1),
+            temperature_low_c: round(temps().fold(f64::MAX, f64::min), 1),
+            precipitation_mm: rain.map(|r| round(r, 1)),
+            precipitation_probability: chance,
+            wind_speed_ms: windiest.wind_speed_ms,
+            wind_bearing: windiest.wind_bearing,
+            wind_gust_ms: day.iter().filter_map(|h| h.wind_gust_ms).reduce(f64::max),
+            humidity: round(mean(day.iter().map(|h| h.humidity)).unwrap(), 0),
+            cloud_coverage: cloud.map(|c| round(c, 0)),
+            uv_index: day.iter().map(|h| h.uv_index).fold(0., f64::max),
+            condition: daily_condition(
+                rain,
+                day.iter().any(|h| h.condition == "pouring"),
+                cloud,
+                windiest.wind_speed_ms,
+            ),
+        });
+    }
+    out
 }
 
 /// The mean of whatever values there are, None for none.
@@ -670,7 +774,7 @@ mod tests {
     #[test]
     fn window_starts_at_the_current_hour() {
         let now = Utc.with_ymd_and_hms(2026, 11, 14, 21, 34, 4).unwrap();
-        let times = valid_times(now);
+        let times = valid_times(now, 24);
         assert_eq!(times.len(), 24);
         assert_eq!(
             times[0],
@@ -700,8 +804,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 11, 17, 1, 20, 0).unwrap();
         let run = Utc.with_ymd_and_hms(2026, 11, 16, 21, 0, 0).unwrap();
         let (lat, lon) = (32.988, -117.122);
-        let mut times = valid_times(now);
-        times.push(times[23] + Duration::hours(1));
+        let times = valid_times(now, 25);
         let resolved: crate::models::Resolved = times
             .iter()
             .map(|&t| (t, run, (t - run).num_hours()))
@@ -725,6 +828,7 @@ mod tests {
             cache.put(&hrrr, &wet_key(&RAIN), Some(if wet { 0.9 } else { 0. }));
         }
         let mut plan = Plan {
+            span: 24,
             model: Model::Rrfs,
             hours: resolved.clone(),
             blend: Some(Blend {
@@ -757,6 +861,59 @@ mod tests {
         assert_eq!(f.hours[0].cloud_coverage, Some(20.));
         assert_eq!(f.hours[1].precipitation_mm, Some(0.));
         assert_eq!(f.blend_model, None);
+    }
+
+    #[test]
+    fn daily_summaries() {
+        let tz: Tz = "America/Los_Angeles".parse().unwrap();
+        // 20:00 PST on the 16th, for 52 hours: 4 hours of today, all of the
+        // 17th and 18th, and 0:00 on the 19th, which is left out.
+        let start = Utc.with_ymd_and_hms(2026, 11, 17, 4, 0, 0).unwrap();
+        let times: Vec<DateTime<Tz>> = (0..53)
+            .map(|h| (start + Duration::hours(h)).with_timezone(&tz))
+            .collect();
+        let hours: Vec<Hour> = times
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                use chrono::Timelike;
+                let day_17 = t.date_naive().to_string() == "2026-11-17";
+                Hour {
+                    time: iso(*t),
+                    run: String::new(),
+                    temperature_c: 10. + t.hour() as f64 / 2.,
+                    dew_point_c: 5.,
+                    humidity: 70.,
+                    wind_speed_ms: if i == 30 { 12. } else { 3. },
+                    wind_gust_ms: Some(5.),
+                    wind_bearing: if i == 30 { 270. } else { 90. },
+                    precipitation_mm: Some(if day_17 { 0.5 } else { 0. }),
+                    precipitation_probability: Some(if day_17 { 60. } else { 0. }),
+                    cloud_coverage: Some(if t.hour() < 12 { 100. } else { 0. }),
+                    uv_index: if (7..17).contains(&t.hour()) { 3. } else { 0. },
+                    daylight: (7..17).contains(&t.hour()),
+                    condition: "cloudy",
+                }
+            })
+            .collect();
+        let today = times[0].date_naive();
+        let days = days(&times, &hours, today);
+        assert_eq!(days.len(), 3);
+        assert_eq!(days[0].date, "2026-11-16T00:00:00-08:00");
+        assert_eq!(days[0].temperature_high_c, 21.5);
+        assert_eq!(days[0].temperature_low_c, 20.);
+        assert_eq!(days[1].date, "2026-11-17T00:00:00-08:00");
+        assert_eq!(days[1].precipitation_mm, Some(12.));
+        assert_eq!(days[1].precipitation_probability, Some(60.));
+        assert_eq!(days[1].condition, "rainy");
+        // Daylight 7:00-16:00, overcast until noon: 5 of 10 hours.
+        assert_eq!(days[1].cloud_coverage, Some(50.));
+        assert_eq!(days[1].uv_index, 3.);
+        // Hour 30 is 2:00 on the 18th.
+        assert_eq!(days[2].wind_speed_ms, 12.);
+        assert_eq!(days[2].wind_bearing, 270.);
+        assert_eq!(days[2].condition, "windy");
+        assert_eq!(days[2].temperature_low_c, 10.);
     }
 
     #[test]
